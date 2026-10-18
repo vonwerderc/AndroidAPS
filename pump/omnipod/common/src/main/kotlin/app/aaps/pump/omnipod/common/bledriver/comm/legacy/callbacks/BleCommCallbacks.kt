@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothProfile
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.utils.toHex
+import app.aaps.pump.omnipod.common.bledriver.comm.exceptions.ConnectException
 import app.aaps.pump.omnipod.common.bledriver.comm.interfaces.io.CharacteristicType.Companion.byValue
 import app.aaps.pump.omnipod.common.bledriver.comm.legacy.io.IncomingPackets
 import app.aaps.pump.omnipod.common.bledriver.comm.session.DisconnectHandler
@@ -83,7 +84,10 @@ class BleCommCallbacks(
             aapsLogger.warn(LTag.PUMPBTCOMM, "Interrupted while waiting for ServiceDiscovery")
             Thread.currentThread().interrupt()
         }
-        return latch.count == 0L && serviceDiscoverySucceeded
+        if (latch.count != 0L) return false
+        // Released by resetConnection() rather than onServicesDiscovered: stop instead of polling until the deadline.
+        if (!serviceDiscoverySucceeded) throw ConnectException("Service discovery aborted")
+        return true
     }
 
     fun confirmWrite(expectedPayload: ByteArray, expectedUUID: String, timeoutMs: Long): WriteConfirmation {
