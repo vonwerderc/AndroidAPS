@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.mockito.kotlin.any
 import org.mockito.kotlin.doAnswer
+import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.inOrder
 import org.mockito.kotlin.mock
@@ -76,10 +77,10 @@ class ServiceDiscoveryRecoveryTest {
             currentGatt
         }
         for (currentGatt in listOf(gatt, retryGatt)) {
-            whenever(currentGatt.discoverServices()).thenAnswer {
+            doAnswer {
                 callbacks.onServicesDiscovered(currentGatt, BluetoothGatt.GATT_SUCCESS)
                 true
-            }
+            }.whenever(currentGatt).discoverServices()
             whenever(currentGatt.getService(serviceUuid)).thenReturn(service)
             whenever(currentGatt.services).thenReturn(emptyList())
         }
@@ -90,12 +91,12 @@ class ServiceDiscoveryRecoveryTest {
     @Test
     fun `missing service after successful callback reconnects once before any messages`() {
         whenever(gatt.getService(serviceUuid)).thenReturn(null)
-        whenever(gatt.discoverServices()).thenAnswer {
+        doAnswer {
             verify(cmdIO, never()).hello()
             verify(cmdIO, never()).readyToRead()
             callbacks.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
             true
-        }
+        }.whenever(gatt).discoverServices()
 
         connection.connect(ConnectionWaitCondition(timeoutMs = 10_000))
 
@@ -160,7 +161,7 @@ class ServiceDiscoveryRecoveryTest {
 
     @Test
     fun `discovery start failure is not retried and closes GATT`() {
-        whenever(gatt.discoverServices()).thenReturn(false)
+        doReturn(false).whenever(gatt).discoverServices()
 
         assertThrows<ConnectException> { connection.connect(ConnectionWaitCondition(timeoutMs = 10_000)) }
 
@@ -172,11 +173,11 @@ class ServiceDiscoveryRecoveryTest {
     @Test
     fun `cancellation after callback prevents recovery and closes GATT`() {
         val stop = CountDownLatch(1)
-        whenever(gatt.discoverServices()).thenAnswer {
+        doAnswer {
             callbacks.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
             stop.countDown()
             true
-        }
+        }.whenever(gatt).discoverServices()
 
         assertThrows<ConnectException> { connection.connect(ConnectionWaitCondition(stopConnection = stop)) }
 
@@ -204,11 +205,11 @@ class ServiceDiscoveryRecoveryTest {
 
     @Test
     fun `interruption after callback closes GATT without starting recovery`() {
-        whenever(gatt.discoverServices()).thenAnswer {
+        doAnswer {
             callbacks.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
             Thread.currentThread().interrupt()
             true
-        }
+        }.whenever(gatt).discoverServices()
         try {
             assertThrows<InterruptedException> { connection.connect(ConnectionWaitCondition(timeoutMs = 10_000)) }
         } finally {
@@ -222,7 +223,7 @@ class ServiceDiscoveryRecoveryTest {
 
     @Test
     fun `discovery timeout does not consume service list or start recovery`() {
-        whenever(gatt.discoverServices()).thenReturn(true)
+        doReturn(true).whenever(gatt).discoverServices()
         val bleCallbacks = BleCommCallbacks(logger, IncomingPackets(), connection)
         val discoverer = ServiceDiscoverer(logger, gatt, bleCallbacks, connection)
 
@@ -250,13 +251,13 @@ class ServiceDiscoveryRecoveryTest {
     fun `late disconnect and discovery callbacks from retired GATT cannot disturb retry`() {
         val stop = CountDownLatch(1)
         whenever(gatt.getService(serviceUuid)).thenReturn(null)
-        whenever(retryGatt.discoverServices()).thenAnswer {
+        doAnswer {
             val retiredCallbacks = callbackHistory.first()
             retiredCallbacks.onConnectionStateChange(gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_DISCONNECTED)
             retiredCallbacks.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
             callbacks.onServicesDiscovered(retryGatt, BluetoothGatt.GATT_SUCCESS)
             true
-        }
+        }.whenever(retryGatt).discoverServices()
 
         connection.connect(ConnectionWaitCondition(stopConnection = stop))
 
@@ -270,7 +271,7 @@ class ServiceDiscoveryRecoveryTest {
     @Test
     fun `fresh GATT must receive its own discovery callback within the shared deadline`() {
         whenever(gatt.getService(serviceUuid)).thenReturn(null)
-        whenever(retryGatt.discoverServices()).thenReturn(true)
+        doReturn(true).whenever(retryGatt).discoverServices()
 
         assertThrows<ConnectException> { connection.connect(ConnectionWaitCondition(timeoutMs = 900)) }
 
