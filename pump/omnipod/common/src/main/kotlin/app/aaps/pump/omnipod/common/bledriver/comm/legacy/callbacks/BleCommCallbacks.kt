@@ -32,10 +32,12 @@ class BleCommCallbacks(
     private var connected: CountDownLatch = CountDownLatch(1)
         @Synchronized get
         @Synchronized set
+    @Volatile private var serviceDiscoveryGatt: BluetoothGatt? = null
+    @Volatile private var serviceDiscoverySucceeded = false
     private val writeQueue: BlockingQueue<WriteConfirmation> = LinkedBlockingQueue()
 
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-        aapsLogger.debug(LTag.PUMPBTCOMM, "OnConnectionStateChange with status/state: $status/$newState")
+        aapsLogger.debug(LTag.PUMPBTCOMM, "OnConnectionStateChange with status/state: $status/$newState gatt=${System.identityHashCode(gatt)}")
         super.onConnectionStateChange(gatt, status, newState)
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
             connected.countDown()
@@ -46,10 +48,16 @@ class BleCommCallbacks(
         }
     }
 
+    @Synchronized
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-        aapsLogger.debug(LTag.PUMPBTCOMM, "OnServicesDiscovered with status: $status")
+        aapsLogger.debug(LTag.PUMPBTCOMM, "OnServicesDiscovered with status: $status gatt=${System.identityHashCode(gatt)}")
         super.onServicesDiscovered(gatt, status)
+        if (gatt !== serviceDiscoveryGatt) {
+            aapsLogger.warn(LTag.PUMPBTCOMM, "Ignoring service discovery from a different GATT")
+            return
+        }
         if (status == BluetoothGatt.GATT_SUCCESS) {
+            serviceDiscoverySucceeded = true
             serviceDiscoveryComplete.countDown()
         }
     }
@@ -60,11 +68,15 @@ class BleCommCallbacks(
             latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: InterruptedException) {
             aapsLogger.warn(LTag.PUMPBTCOMM, "Interrupted while waiting for Connection")
+            Thread.currentThread().interrupt()
         }
         return latch.count == 0L
     }
 
-    fun startServiceDiscovery() {
+    @Synchronized
+    fun startServiceDiscovery(gatt: BluetoothGatt) {
+        serviceDiscoveryGatt = gatt
+        serviceDiscoverySucceeded = false
         serviceDiscoveryComplete = CountDownLatch(1)
     }
 
@@ -74,8 +86,9 @@ class BleCommCallbacks(
             latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: InterruptedException) {
             aapsLogger.warn(LTag.PUMPBTCOMM, "Interrupted while waiting for ServiceDiscovery")
+            Thread.currentThread().interrupt()
         }
-        return latch.count == 0L
+        return latch.count == 0L && serviceDiscoverySucceeded
     }
 
     fun confirmWrite(expectedPayload: ByteArray, expectedUUID: String, timeoutMs: Long): WriteConfirmation {
@@ -206,7 +219,10 @@ class BleCommCallbacks(
         }
     }
 
+    @Synchronized
     fun resetConnection() {
+        serviceDiscoveryGatt = null
+        serviceDiscoverySucceeded = false
         aapsLogger.debug(LTag.PUMPBTCOMM, "Reset connection")
         connected.countDown()
         serviceDiscoveryComplete.countDown()

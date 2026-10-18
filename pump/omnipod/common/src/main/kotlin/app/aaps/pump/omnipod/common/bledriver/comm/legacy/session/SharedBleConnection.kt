@@ -6,7 +6,6 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
-import android.os.SystemClock
 import app.aaps.core.data.configuration.Constants
 import app.aaps.core.interfaces.configuration.Config
 import app.aaps.core.interfaces.logging.AAPSLogger
@@ -34,6 +33,7 @@ import app.aaps.pump.omnipod.common.bledriver.comm.session.Session
 import app.aaps.pump.omnipod.common.bledriver.comm.session.SessionEstablisher
 import app.aaps.pump.omnipod.common.bledriver.comm.session.SessionKeys
 import app.aaps.pump.omnipod.common.bledriver.comm.session.SessionNegotiationResynchronization
+import java.util.concurrent.TimeUnit
 
 abstract class SharedBleConnection(
     protected val podDevice: BluetoothDevice,
@@ -44,10 +44,12 @@ abstract class SharedBleConnection(
 
     protected abstract val connectionName: String
     protected val incomingPackets = IncomingPackets()
-    protected val bleCommCallbacks by lazy { BleCommCallbacks(aapsLogger, incomingPackets, this) }
+    @Volatile
+    protected var bleCommCallbacks = createCallbacks()
+        private set
     protected var gattConnection: BluetoothGatt? = null
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?
-    private var connectionWaitCondition: ConnectionWaitCondition? = null
+    @Volatile private var connectionWaitCondition: ConnectionWaitCondition? = null
 
     @Volatile
     final override var session: Session? = null
@@ -63,9 +65,10 @@ abstract class SharedBleConnection(
     protected abstract fun createSession(messageIO: MessageIO, ids: Ids, keys: SessionKeys, enDecrypt: EnDecrypt): Session
     protected open fun discoverServices(
         gatt: BluetoothGatt,
-        connectionWaitCond: ConnectionWaitCondition
+        connectionWaitCond: ConnectionWaitCondition,
+        deadline: Long
     ): Map<CharacteristicType, BluetoothGattCharacteristic> =
-        ServiceDiscoverer(aapsLogger, gatt, bleCommCallbacks, this).discoverServices(connectionWaitCond)
+        ServiceDiscoverer(aapsLogger, gatt, bleCommCallbacks, this).discoverServices(connectionWaitCond, deadline)
 
     protected open fun createMessageIO(
         gatt: BluetoothGatt,
@@ -94,31 +97,16 @@ abstract class SharedBleConnection(
         connectionWaitCondition = connectionWaitCond
         recordConnectionAttempt()
         updateConnectionState(LifecycleState.CONNECTING)
-        var gatt = gattConnection
-        if (gatt == null) {
-            gatt = connectGatt()
-            if (gatt == null) {
-                Thread.sleep(SLEEP_WHEN_FAILING_TO_CONNECT_GATT)
-                throw FailedToConnectException("connectGatt() returned null")
-            }
-            gattConnection = gatt
-        } else if (!gatt.connect()) {
-            throw FailedToConnectException("connect() returned false")
-        }
-
-        val before = SystemClock.elapsedRealtime()
-        if (waitForConnection(connectionWaitCond) !is Connected) {
-            updateConnectionState(LifecycleState.DISCONNECTED)
+        // The reconnect and both discoveries share the existing connection budget.
+        val timeoutMs = connectionWaitCond.timeoutMs ?: MAX_WAIT_FOR_CONNECTION_SECONDS * 1000L
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        val (gatt, discovered) = try {
+            connectAndDiscover(connectionWaitCond, deadline)
+        } catch (ex: Exception) {
             connectionWaitCondition = null
-            throw FailedToConnectException(podDevice.address)
+            disconnect(true)
+            throw ex
         }
-        connectionWaitCond.timeoutMs?.let { timeoutMs ->
-            connectionWaitCond.timeoutMs = (timeoutMs - (SystemClock.elapsedRealtime() - before))
-                .coerceAtLeast(MIN_DISCOVERY_TIMEOUT_MS)
-        }
-        updateConnectionState(LifecycleState.CONNECTED)
-
-        val discovered = discoverServices(gatt, connectionWaitCond)
         prepareGatt(gatt)
         val (cmdBleIO, dataBleIO) = createMessageIO(gatt, discovered)
         msgIO = MessageIO(aapsLogger, cmdBleIO, dataBleIO)
@@ -128,6 +116,66 @@ abstract class SharedBleConnection(
         connectionWaitCondition = null
     }
 
+    private fun connectAndDiscover(
+        connectionWaitCond: ConnectionWaitCondition,
+        deadline: Long
+    ): Pair<BluetoothGatt, Map<CharacteristicType, BluetoothGattCharacteristic>> {
+        for (attempt in 0..1) {
+            checkConnectionWait(connectionWaitCond, deadline)
+            var gatt = gattConnection
+            if (gatt == null) {
+                gatt = connectGatt()
+                if (gatt == null) {
+                    Thread.sleep(minOf(SLEEP_WHEN_FAILING_TO_CONNECT_GATT, remainingMs(deadline).coerceAtLeast(0)))
+                    throw FailedToConnectException("connectGatt() returned null")
+                }
+                gattConnection = gatt
+            } else if (!gatt.connect()) {
+                throw FailedToConnectException("connect() returned false")
+            }
+            val waitCondition = remainingWaitCondition(connectionWaitCond, deadline)
+            if (waitForConnection(waitCondition, deadline) !is Connected) {
+                throw FailedToConnectException(podDevice.address)
+            }
+            updateConnectionState(LifecycleState.CONNECTED)
+            try {
+                val discovered = discoverServices(gatt, remainingWaitCondition(connectionWaitCond, deadline), deadline)
+                if (attempt > 0) aapsLogger.info(LTag.PUMPBTCOMM, "DASH service recovered on fresh GATT retry")
+                return gatt to discovered
+            } catch (ex: MissingServiceException) {
+                if (attempt == 1) throw ConnectException("${ex.message} (after one recovery)")
+                aapsLogger.warn(LTag.PUMPBTCOMM, "DASH service missing after successful discovery; reconnecting once with fresh GATT")
+                disconnect(true)
+                checkConnectionWait(connectionWaitCond, deadline)
+                if (remainingMs(deadline) <= MISSING_SERVICE_RETRY_DELAY_MS) throw ConnectException("connection timeout")
+                Thread.sleep(MISSING_SERVICE_RETRY_DELAY_MS)
+                updateConnectionState(LifecycleState.CONNECTING)
+            }
+        }
+        throw ConnectException("Service discovery failed")
+    }
+
+    private fun remainingWaitCondition(condition: ConnectionWaitCondition, deadline: Long): ConnectionWaitCondition {
+        checkConnectionWait(condition, deadline)
+        return if (condition.stopConnection != null) condition else ConnectionWaitCondition(timeoutMs = remainingMs(deadline))
+    }
+
+    private fun checkConnectionWait(condition: ConnectionWaitCondition, deadline: Long) {
+        if (Thread.currentThread().isInterrupted) throw InterruptedException("Connection interrupted")
+        if (condition.stopConnection?.count == 0L) throw ConnectException("stopConnecting called")
+        if (remainingMs(deadline) <= 0) throw ConnectException("connection timeout")
+    }
+
+    private fun remainingMs(deadline: Long): Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+
+    private fun createCallbacks(): BleCommCallbacks {
+        lateinit var callbacks: BleCommCallbacks
+        callbacks = BleCommCallbacks(aapsLogger, incomingPackets, object : DisconnectHandler {
+            override fun onConnectionLost(status: Int) = this@SharedBleConnection.onConnectionLost(callbacks, status)
+        })
+        return callbacks
+    }
+
     @Synchronized
     final override fun disconnect(closeGatt: Boolean) {
         aapsLogger.debug(LTag.PUMPBTCOMM, "Disconnecting $connectionName closeGatt=$closeGatt")
@@ -135,31 +183,33 @@ abstract class SharedBleConnection(
             gattConnection?.disconnect()
             updateConnectionState(LifecycleState.DISCONNECTED)
         } else {
-            gattConnection?.close()
-            bleCommCallbacks.resetConnection()
+            // Retire callbacks before closing: a late disconnect must not close the next GATT.
+            val oldGatt = gattConnection
+            val oldCallbacks = bleCommCallbacks
             gattConnection = null
+            bleCommCallbacks = createCallbacks()
+            oldCallbacks.resetConnection()
             session = null
             msgIO = null
             updateConnectionState(LifecycleState.DISCONNECTED)
+            oldGatt?.close()
         }
     }
 
-    private fun waitForConnection(connectionWaitCond: ConnectionWaitCondition): ConnectionState {
+    private fun waitForConnection(connectionWaitCond: ConnectionWaitCondition, deadline: Long): ConnectionState {
         aapsLogger.debug(LTag.PUMPBTCOMM, "waitForConnection connectionWaitCond=$connectionWaitCond")
         try {
             connectionWaitCond.timeoutMs?.let(bleCommCallbacks::waitForConnection)
-            val startWaiting = System.currentTimeMillis()
-            connectionWaitCond.stopConnection?.let { stopConnection ->
-                while (!bleCommCallbacks.waitForConnection(STOP_CONNECTING_CHECK_INTERVAL_MS)) {
-                    if (stopConnection.count == 0L) throw ConnectException("stopConnecting called")
-                    if ((System.currentTimeMillis() - startWaiting) / 1000 > MAX_WAIT_FOR_CONNECTION_SECONDS) {
-                        throw ConnectException("connection timeout")
-                    }
+            connectionWaitCond.stopConnection?.let {
+                while (!bleCommCallbacks.waitForConnection(minOf(remainingMs(deadline), STOP_CONNECTING_CHECK_INTERVAL_MS))) {
+                    checkConnectionWait(connectionWaitCond, deadline)
                 }
             }
-        } catch (_: InterruptedException) {
-            aapsLogger.info(LTag.PUMPBTCOMM, "Interrupted while waiting for $connectionName connection")
+        } catch (ex: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw ex
         }
+        checkConnectionWait(connectionWaitCond, deadline)
         return connectionState()
     }
 
@@ -194,18 +244,26 @@ abstract class SharedBleConnection(
         }
     }
 
-    final override fun onConnectionLost(status: Int) {
+    final override fun onConnectionLost(status: Int) = onConnectionLost(bleCommCallbacks, status)
+
+    private fun onConnectionLost(callbacks: BleCommCallbacks, status: Int) {
+        if (callbacks !== bleCommCallbacks) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Ignoring disconnect from retired GATT")
+            return
+        }
         aapsLogger.info(LTag.PUMPBTCOMM, "Lost $connectionName connection with status: $status")
         connectionWaitCondition?.stopConnection?.let {
             if (it.count > 0) it.countDown()
         }
-        disconnect(true)
+        synchronized(this) {
+            if (callbacks === bleCommCallbacks) disconnect(true)
+        }
     }
 
     companion object {
-        const val MIN_DISCOVERY_TIMEOUT_MS = 10_000L
         const val MAX_WAIT_FOR_CONNECTION_SECONDS = Constants.PUMP_MAX_CONNECTION_TIME_IN_SECONDS + 10
         const val SLEEP_WHEN_FAILING_TO_CONNECT_GATT = 10_000L
+        private const val MISSING_SERVICE_RETRY_DELAY_MS = 500L
     }
 
     protected enum class LifecycleState {
