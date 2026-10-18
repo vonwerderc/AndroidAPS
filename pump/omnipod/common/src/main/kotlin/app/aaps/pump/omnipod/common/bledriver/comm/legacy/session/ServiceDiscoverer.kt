@@ -26,12 +26,7 @@ class ServiceDiscoverer(
     /**
      * This is first step after connection establishment
      */
-    fun discoverServices(
-        connectionWaitCond: ConnectionWaitCondition,
-        deadline: Long = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
-            connectionWaitCond.timeoutMs ?: SharedBleConnection.MAX_WAIT_FOR_CONNECTION_SECONDS * 1000L
-        )
-    ): Map<CharacteristicType, BluetoothGattCharacteristic> {
+    fun discoverServices(connectionWaitCond: ConnectionWaitCondition, deadline: Long): Map<CharacteristicType, BluetoothGattCharacteristic> {
         val service = discoverService(connectionWaitCond, deadline)
             ?: throw MissingServiceException()
         val cmdChar = service.getCharacteristic(CharacteristicType.CMD.uuid)
@@ -47,7 +42,7 @@ class ServiceDiscoverer(
     private fun discoverService(connectionWaitCond: ConnectionWaitCondition, deadline: Long): BluetoothGattService? {
         checkConnection(connectionWaitCond, deadline)
         logger.debug(LTag.PUMPBTCOMM, "Discovering services gatt=${System.identityHashCode(gatt)}")
-        bleCallbacks.startServiceDiscovery(gatt)
+        bleCallbacks.startServiceDiscovery()
         try {
             if (!gatt.discoverServices()) throw ConnectException("Could not start discovering services")
         } catch (_: SecurityException) {
@@ -68,9 +63,8 @@ class ServiceDiscoverer(
 
     private fun checkConnection(connectionWaitCond: ConnectionWaitCondition, deadline: Long) {
         if (Thread.currentThread().isInterrupted) throw InterruptedException("Service discovery interrupted")
-        if (connectionWaitCond.stopConnection?.count == 0L || connection.connectionState() !is Connected) {
-            throw ConnectException("stopConnecting called")
-        }
+        if (connectionWaitCond.stopConnection?.count == 0L) throw ConnectException("stopConnecting called")
+        if (connection.connectionState() !is Connected) throw ConnectException("Connection lost during service discovery")
         if (remainingMs(deadline) <= 0) throw ConnectException("Service discovery timeout")
     }
 

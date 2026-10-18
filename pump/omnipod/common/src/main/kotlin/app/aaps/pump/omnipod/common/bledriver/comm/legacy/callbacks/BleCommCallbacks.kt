@@ -32,7 +32,7 @@ class BleCommCallbacks(
     private var connected: CountDownLatch = CountDownLatch(1)
         @Synchronized get
         @Synchronized set
-    @Volatile private var serviceDiscoveryGatt: BluetoothGatt? = null
+    // Each GATT gets its own callbacks instance, so these callbacks need no GATT identity check.
     @Volatile private var serviceDiscoverySucceeded = false
     private val writeQueue: BlockingQueue<WriteConfirmation> = LinkedBlockingQueue()
 
@@ -52,10 +52,6 @@ class BleCommCallbacks(
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
         aapsLogger.debug(LTag.PUMPBTCOMM, "OnServicesDiscovered with status: $status gatt=${System.identityHashCode(gatt)}")
         super.onServicesDiscovered(gatt, status)
-        if (gatt !== serviceDiscoveryGatt) {
-            aapsLogger.warn(LTag.PUMPBTCOMM, "Ignoring service discovery from a different GATT")
-            return
-        }
         if (status == BluetoothGatt.GATT_SUCCESS) {
             serviceDiscoverySucceeded = true
             serviceDiscoveryComplete.countDown()
@@ -74,8 +70,7 @@ class BleCommCallbacks(
     }
 
     @Synchronized
-    fun startServiceDiscovery(gatt: BluetoothGatt) {
-        serviceDiscoveryGatt = gatt
+    fun startServiceDiscovery() {
         serviceDiscoverySucceeded = false
         serviceDiscoveryComplete = CountDownLatch(1)
     }
@@ -221,7 +216,6 @@ class BleCommCallbacks(
 
     @Synchronized
     fun resetConnection() {
-        serviceDiscoveryGatt = null
         serviceDiscoverySucceeded = false
         aapsLogger.debug(LTag.PUMPBTCOMM, "Reset connection")
         connected.countDown()

@@ -97,7 +97,7 @@ abstract class SharedBleConnection(
         connectionWaitCondition = connectionWaitCond
         recordConnectionAttempt()
         updateConnectionState(LifecycleState.CONNECTING)
-        // The reconnect and both discoveries share the existing connection budget.
+        // One budget covers connect, both discoveries and the retry; there is no separate discovery floor.
         val timeoutMs = connectionWaitCond.timeoutMs ?: MAX_WAIT_FOR_CONNECTION_SECONDS * 1000L
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         val (gatt, discovered) = try {
@@ -120,39 +120,45 @@ abstract class SharedBleConnection(
         connectionWaitCond: ConnectionWaitCondition,
         deadline: Long
     ): Pair<BluetoothGatt, Map<CharacteristicType, BluetoothGattCharacteristic>> {
-        for (attempt in 0..1) {
-            checkConnectionWait(connectionWaitCond, deadline)
-            var gatt = gattConnection
-            if (gatt == null) {
-                gatt = connectGatt()
-                if (gatt == null) {
-                    Thread.sleep(minOf(SLEEP_WHEN_FAILING_TO_CONNECT_GATT, remainingMs(deadline).coerceAtLeast(0)))
-                    throw FailedToConnectException("connectGatt() returned null")
-                }
-                gattConnection = gatt
-            } else if (!gatt.connect()) {
-                throw FailedToConnectException("connect() returned false")
-            }
-            val waitCondition = remainingWaitCondition(connectionWaitCond, deadline)
-            if (waitForConnection(waitCondition, deadline) !is Connected) {
-                throw FailedToConnectException(podDevice.address)
-            }
-            updateConnectionState(LifecycleState.CONNECTED)
-            try {
-                val discovered = discoverServices(gatt, remainingWaitCondition(connectionWaitCond, deadline), deadline)
-                if (attempt > 0) aapsLogger.info(LTag.PUMPBTCOMM, "DASH service recovered on fresh GATT retry")
-                return gatt to discovered
-            } catch (ex: MissingServiceException) {
-                if (attempt == 1) throw ConnectException("${ex.message} (after one recovery)")
-                aapsLogger.warn(LTag.PUMPBTCOMM, "DASH service missing after successful discovery; reconnecting once with fresh GATT")
-                disconnect(true)
-                checkConnectionWait(connectionWaitCond, deadline)
-                if (remainingMs(deadline) <= MISSING_SERVICE_RETRY_DELAY_MS) throw ConnectException("connection timeout")
-                Thread.sleep(MISSING_SERVICE_RETRY_DELAY_MS)
-                updateConnectionState(LifecycleState.CONNECTING)
-            }
+        try {
+            return connectAndDiscoverOnce(connectionWaitCond, deadline)
+        } catch (_: MissingServiceException) {
+            aapsLogger.warn(LTag.PUMPBTCOMM, "DASH service missing after successful discovery; reconnecting once with fresh GATT")
         }
-        throw ConnectException("Service discovery failed")
+        disconnect(true)
+        checkConnectionWait(connectionWaitCond, deadline)
+        if (remainingMs(deadline) <= MISSING_SERVICE_RETRY_DELAY_MS) throw ConnectException("connection timeout")
+        Thread.sleep(MISSING_SERVICE_RETRY_DELAY_MS)
+        updateConnectionState(LifecycleState.CONNECTING)
+        try {
+            return connectAndDiscoverOnce(connectionWaitCond, deadline)
+                .also { aapsLogger.info(LTag.PUMPBTCOMM, "DASH service recovered on fresh GATT retry") }
+        } catch (ex: MissingServiceException) {
+            throw ConnectException("${ex.message} (after one recovery)")
+        }
+    }
+
+    private fun connectAndDiscoverOnce(
+        connectionWaitCond: ConnectionWaitCondition,
+        deadline: Long
+    ): Pair<BluetoothGatt, Map<CharacteristicType, BluetoothGattCharacteristic>> {
+        checkConnectionWait(connectionWaitCond, deadline)
+        var gatt = gattConnection
+        if (gatt == null) {
+            gatt = connectGatt()
+            if (gatt == null) {
+                Thread.sleep(minOf(SLEEP_WHEN_FAILING_TO_CONNECT_GATT, remainingMs(deadline).coerceAtLeast(0)))
+                throw FailedToConnectException("connectGatt() returned null")
+            }
+            gattConnection = gatt
+        } else if (!gatt.connect()) {
+            throw FailedToConnectException("connect() returned false")
+        }
+        if (waitForConnection(remainingWaitCondition(connectionWaitCond, deadline), deadline) !is Connected) {
+            throw FailedToConnectException(podDevice.address)
+        }
+        updateConnectionState(LifecycleState.CONNECTED)
+        return gatt to discoverServices(gatt, remainingWaitCondition(connectionWaitCond, deadline), deadline)
     }
 
     private fun remainingWaitCondition(condition: ConnectionWaitCondition, deadline: Long): ConnectionWaitCondition {

@@ -43,6 +43,7 @@ import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 @Suppress("DEPRECATION")
 @Timeout(10)
@@ -227,7 +228,7 @@ class ServiceDiscoveryRecoveryTest {
         val bleCallbacks = BleCommCallbacks(logger, IncomingPackets(), connection)
         val discoverer = ServiceDiscoverer(logger, gatt, bleCallbacks, connection)
 
-        val error = assertThrows<ConnectException> { discoverer.discoverServices(ConnectionWaitCondition(timeoutMs = 30)) }
+        val error = assertThrows<ConnectException> { discoverer.discoverServices(ConnectionWaitCondition(timeoutMs = 30), deadlineIn(30)) }
 
         assertEquals("Service discovery timeout", error.message)
         verify(gatt, times(1)).discoverServices()
@@ -283,27 +284,54 @@ class ServiceDiscoveryRecoveryTest {
     }
 
     @Test
-    fun `successful discovery from a different GATT does not release the waiter`() {
-        val bleCallbacks = BleCommCallbacks(logger, IncomingPackets(), connection)
-        bleCallbacks.startServiceDiscovery(gatt)
+    fun `stale CONNECTED from retired GATT does not release the replacement connection wait`() {
+        whenever(gatt.getService(serviceUuid)).thenReturn(null)
+        whenever(device.connectGatt(eq(context), eq(false), any(), eq(BluetoothDevice.TRANSPORT_LE))).thenAnswer {
+            callbacks = it.getArgument(2)
+            callbackHistory.add(callbacks)
+            if (callbackHistory.size == 1) {
+                callbacks.onConnectionStateChange(gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED)
+                gatt
+            } else {
+                callbackHistory.first().onConnectionStateChange(gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED)
+                retryGatt
+            }
+        }
 
-        bleCallbacks.onServicesDiscovered(mock(), BluetoothGatt.GATT_SUCCESS)
-        assertFalse(bleCallbacks.waitForServiceDiscovery(0))
+        val error = assertThrows<ConnectException> { connection.connect(ConnectionWaitCondition(timeoutMs = 1_500)) }
 
-        bleCallbacks.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
-        assertTrue(bleCallbacks.waitForServiceDiscovery(0))
+        assertEquals("connection timeout", error.message)
+        verify(retryGatt, never()).discoverServices()
+        verify(gatt, times(1)).close()
+        verify(retryGatt, times(1)).close()
+        assertNoMessages()
+    }
+
+    @Test
+    fun `link loss during synchronous discovery is reported separately from stopConnecting`() {
+        doReturn(true).whenever(gatt).discoverServices()
+        whenever(bluetoothManager.getConnectionState(device, BluetoothProfile.GATT))
+            .thenReturn(BluetoothProfile.STATE_CONNECTED, BluetoothProfile.STATE_DISCONNECTED)
+        val discoverer = ServiceDiscoverer(logger, gatt, BleCommCallbacks(logger, IncomingPackets(), connection), connection)
+
+        val error = assertThrows<ConnectException> { discoverer.discoverServices(ConnectionWaitCondition(timeoutMs = 5_000), deadlineIn(5_000)) }
+
+        assertEquals("Connection lost during service discovery", error.message)
+        verify(gatt, never()).getService(any())
     }
 
     @Test
     fun `reset and failed status cannot masquerade as successful discovery`() {
         val bleCallbacks = BleCommCallbacks(logger, IncomingPackets(), connection)
-        bleCallbacks.startServiceDiscovery(gatt)
+        bleCallbacks.startServiceDiscovery()
         bleCallbacks.onServicesDiscovered(gatt, 133)
         assertFalse(bleCallbacks.waitForServiceDiscovery(0))
 
         bleCallbacks.resetConnection()
         assertFalse(bleCallbacks.waitForServiceDiscovery(0))
     }
+
+    private fun deadlineIn(ms: Long) = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms)
 
     private fun assertNoMessages() {
         verify(cmdIO, never()).hello()
