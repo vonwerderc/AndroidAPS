@@ -269,7 +269,7 @@ abstract class SharedBleConnection(
     companion object {
         const val MAX_WAIT_FOR_CONNECTION_SECONDS = Constants.PUMP_MAX_CONNECTION_TIME_IN_SECONDS + 10
         const val SLEEP_WHEN_FAILING_TO_CONNECT_GATT = 10_000L
-        private const val MISSING_SERVICE_RETRY_DELAY_MS = 500L
+        private const val MISSING_SERVICE_RETRY_DELAY_MS = 200L
     }
 
     protected enum class LifecycleState {
