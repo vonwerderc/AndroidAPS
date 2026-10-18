@@ -190,6 +190,8 @@ jobs:
           else
             VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
           fi
+          # Local test build: keep it out of the stock AAPS/<version> Drive folder and file name.
+          VERSION="${VERSION}-activationfix"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Set up JDK
