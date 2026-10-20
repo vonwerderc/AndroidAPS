@@ -110,6 +110,7 @@ class OmnipodDashBleManagerImpl(
             if (ex.msg.startsWith(BleConnection.SERVICE_NOT_FOUND)) throw ConnectException("${ex.msg} (after one reconnect)")
             throw ex
         }
+        if (isCancelled()) throw ConnectException("Pod activation cancelled")
         aapsLogger.info(LTag.PUMPBTCOMM, "DASH service found on reconnect")
         return second
     }

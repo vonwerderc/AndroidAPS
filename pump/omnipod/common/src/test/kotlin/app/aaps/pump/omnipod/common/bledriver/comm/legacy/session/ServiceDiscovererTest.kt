@@ -13,6 +13,7 @@ import org.junit.jupiter.api.assertThrows
 import org.mockito.kotlin.any
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
+import java.util.concurrent.CountDownLatch
 
 class ServiceDiscovererTest {
 
@@ -44,5 +45,14 @@ class ServiceDiscovererTest {
 
         assertThat(ex.msg).startsWith("Service discovery did not complete")
         assertThat(ex.msg).doesNotContain(BleConnection.SERVICE_NOT_FOUND)
+    }
+
+    @Test
+    fun `a routine connection without the service still reports service not found`() {
+        whenever(callbacks.waitForServiceDiscovery(any())).thenReturn(true)
+
+        val ex = assertThrows<ConnectException> { discoverer.discoverServices(ConnectionWaitCondition(stopConnection = CountDownLatch(1))) }
+
+        assertThat(ex.msg).startsWith(BleConnection.SERVICE_NOT_FOUND)
     }
 }
