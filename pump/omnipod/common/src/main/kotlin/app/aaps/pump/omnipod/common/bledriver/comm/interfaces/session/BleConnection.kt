@@ -24,5 +24,8 @@ interface BleConnection : DisconnectHandler {
 
     companion object {
         const val DEFAULT_CONNECT_TIMEOUT_MS = 30000L
+
+        // Message prefix of the ConnectException thrown when discovery completed without the pod's service.
+        const val SERVICE_NOT_FOUND = "Service not found"
     }
 }

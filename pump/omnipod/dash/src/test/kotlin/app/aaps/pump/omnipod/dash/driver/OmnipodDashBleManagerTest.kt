@@ -474,7 +474,7 @@ class OmnipodDashBleManagerTest {
     }
 
     @Test
-    fun `a new pod whose service is missing twice fails after one recovery and releases the busy lock`() {
+    fun `a new pod whose service is missing twice fails after one reconnect and releases the busy lock`() {
         val first: BleConnection = mock()
         val second: BleConnection = mock()
         prepareNewPodScan()
@@ -484,7 +484,7 @@ class OmnipodDashBleManagerTest {
 
         manager.pairNewPod().test()
             .assertValues(PodEvent.Scanning, PodEvent.BluetoothConnecting)
-            .assertError { it is ConnectException && it.msg == "Service not found: 1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f (after one recovery)" }
+            .assertError { it is ConnectException && it.msg == "Service not found: 1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f (after one reconnect)" }
 
         verify(connectionFactory, times(2)).createConnection(address)
         verify(first).disconnect(true)
@@ -508,6 +508,73 @@ class OmnipodDashBleManagerTest {
         verify(connection).connect(any())
         verify(connection).disconnect(false)
         verify(connection, never()).disconnect(true)
+    }
+
+    @Test
+    fun `a new pod whose service discovery did not complete is not retried`() {
+        val error = ConnectException("Service discovery did not complete: 1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f")
+        prepareNewPodScan()
+        doAnswer { throw error }.whenever(connection).connect(any())
+
+        manager.pairNewPod().test()
+            .assertValues(PodEvent.Scanning, PodEvent.BluetoothConnecting)
+            .assertError { it === error }
+
+        verify(connectionFactory).createConnection(address)
+        verify(connection, never()).disconnect(true)
+    }
+
+    @Test
+    fun `a new pod failing to connect is not retried`() {
+        val error = FailedToConnectException(address)
+        prepareNewPodScan()
+        doAnswer { throw error }.whenever(connection).connect(any())
+
+        manager.pairNewPod().test()
+            .assertValues(PodEvent.Scanning, PodEvent.BluetoothConnecting)
+            .assertError { it === error }
+
+        verify(connectionFactory).createConnection(address)
+        verify(connection, never()).disconnect(true)
+    }
+
+    @Test
+    fun `a cancelled activation is not retried when the service is missing`() {
+        val error = ConnectException("Service not found: 1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f")
+        val observer = TestObserver<PodEvent>()
+        prepareNewPodScan()
+        doAnswer {
+            observer.dispose()
+            throw error
+        }.whenever(connection).connect(any())
+
+        manager.pairNewPod().subscribe(observer)
+
+        observer.assertValues(PodEvent.Scanning, PodEvent.BluetoothConnecting).assertNotComplete()
+        verify(connectionFactory).createConnection(address)
+        verify(connection).disconnect(false)
+        verify(connection, never()).disconnect(true)
+        whenever(podState.ltk).thenReturn(ltk)
+        manager.pairNewPod().test().assertResult(PodEvent.AlreadyPaired)
+    }
+
+    @Test
+    fun `another failure of the reconnect is reported unchanged`() {
+        val first: BleConnection = mock()
+        val second: BleConnection = mock()
+        val error = FailedToConnectException(address)
+        prepareNewPodScan()
+        whenever(connectionFactory.createConnection(address)).thenReturn(first, second)
+        doAnswer { throw ConnectException("Service not found: 1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f") }.whenever(first).connect(any())
+        doAnswer { throw error }.whenever(second).connect(any())
+
+        manager.pairNewPod().test()
+            .assertValues(PodEvent.Scanning, PodEvent.BluetoothConnecting)
+            .assertError { it === error }
+
+        verify(connectionFactory, times(2)).createConnection(address)
+        verify(first).disconnect(true)
+        verify(second).disconnect(false)
     }
 
     private fun prepareNewPodScan() {
