@@ -64,9 +64,7 @@ class OmnipodDashBleManagerImpl(
             podState.bluetoothAddress = podAddress
 
             emitter.onNext(PodEvent.BluetoothConnecting)
-            val conn = createConnection(podAddress)
-            connection = conn
-            conn.connect(ConnectionWaitCondition(timeoutMs = BleConnection.DEFAULT_CONNECT_TIMEOUT_MS))
+            val conn = connectNewPod(podAddress) { emitter.isDisposed }
             emitter.onNext(PodEvent.BluetoothConnected(podAddress))
 
             emitter.onNext(PodEvent.Pairing)
@@ -86,7 +84,40 @@ class OmnipodDashBleManagerImpl(
         }
     }
 
+    // On some phones (seen on a OnePlus with Android 16) the first service discovery on a newly established link
+    // completes with status 0 and an empty service list, while reconnecting right away, before the stack drops the
+    // idle link (about a second), finds the service. Routine connections get that quick reconnect from their next
+    // attempt; activation rescans before every manual retry, so a new pod gets one immediate retry here instead.
+    // Keep the delay well under a second, or the retry starts on a new link again.
+    private fun connectNewPod(podAddress: String, isCancelled: () -> Boolean): BleConnection {
+        val first = createConnection(podAddress)
+        connection = first
+        try {
+            first.connect(ConnectionWaitCondition(timeoutMs = BleConnection.DEFAULT_CONNECT_TIMEOUT_MS))
+            return first
+        } catch (ex: ConnectException) {
+            if (!ex.msg.startsWith(BleConnection.SERVICE_NOT_FOUND) || isCancelled()) throw ex
+            aapsLogger.warn(LTag.PUMPBTCOMM, "DASH service not found on new pod; reconnecting once")
+        }
+        first.disconnect(true)
+        Thread.sleep(MISSING_SERVICE_RETRY_DELAY_MS)
+        if (isCancelled()) throw ConnectException("Pod activation cancelled")
+        val second = createConnection(podAddress)
+        connection = second
+        try {
+            second.connect(ConnectionWaitCondition(timeoutMs = BleConnection.DEFAULT_CONNECT_TIMEOUT_MS))
+        } catch (ex: ConnectException) {
+            if (ex.msg.startsWith(BleConnection.SERVICE_NOT_FOUND)) throw ConnectException("${ex.msg} (after one reconnect)")
+            throw ex
+        }
+        if (isCancelled()) throw ConnectException("Pod activation cancelled")
+        aapsLogger.info(LTag.PUMPBTCOMM, "DASH service found on reconnect")
+        return second
+    }
+
     companion object {
         const val CONTROLLER_ID = 4242 // TODO read from preferences or somewhere else.
+
+        private const val MISSING_SERVICE_RETRY_DELAY_MS = 200L
     }
 }

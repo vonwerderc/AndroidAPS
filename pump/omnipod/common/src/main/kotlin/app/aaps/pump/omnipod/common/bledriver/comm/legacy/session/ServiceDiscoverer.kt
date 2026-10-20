@@ -35,8 +35,9 @@ class ServiceDiscoverer(
         } catch (ex: SecurityException) {
             throw ConnectException("Missing bluetooth permission")
         }
+        var discoveryCompleted = true
         connectionWaitCond.timeoutMs?.let {
-            bleCallbacks.waitForServiceDiscovery(it)
+            discoveryCompleted = bleCallbacks.waitForServiceDiscovery(it)
         }
         connectionWaitCond.stopConnection?.let {
             while (!bleCallbacks.waitForServiceDiscovery(STOP_CONNECTING_CHECK_INTERVAL_MS)) {
@@ -44,6 +45,7 @@ class ServiceDiscoverer(
                     throw ConnectException("stopConnecting called")
                 }
             }
+            discoveryCompleted = true
         }
         logger.debug(LTag.PUMPBTCOMM, "Services discovered")
         val service = gatt.getService(SERVICE_UUID.toUuid())
@@ -51,7 +53,8 @@ class ServiceDiscoverer(
                 for (svc in gatt.services) {
                     logger.debug(LTag.PUMPBTCOMM, "Found service: ${svc.uuid}")
                 }
-                throw ConnectException("Service not found: $SERVICE_UUID")
+                if (!discoveryCompleted) throw ConnectException("Service discovery did not complete: $SERVICE_UUID")
+                throw ConnectException("${BleConnection.SERVICE_NOT_FOUND}: $SERVICE_UUID")
             }
         val cmdChar = service.getCharacteristic(CharacteristicType.CMD.uuid)
             ?: throw ConnectException("Characteristic not found: ${CharacteristicType.CMD.value}")
